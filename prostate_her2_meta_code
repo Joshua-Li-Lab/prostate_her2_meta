@@ -1,0 +1,487 @@
+import math
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+from scipy.stats import fisher_exact, norm
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+file_path = r'data.xlsx'
+
+sheet_names = [
+    'Xtab_master_1',  # prostate_metastatic
+    'Xtab_master_2',  # gs6_gs7
+    'Xtab_master_3',  # local_metastatic
+    'Xtab_master_4',  # high_low
+    'Xtab_master_5'   # young_old
+]
+
+sheet_labels = [
+    'Prostate vs. metastatic',
+    'GS6 vs. GS7',
+    'Local vs. metastatic',
+    'High vs. low',
+    'Young vs. old'
+]
+
+exclude_list = []
+
+output_dir = 'results'
+os.makedirs(output_dir, exist_ok=True)
+
+# ==============================================================================
+# PART 1: CROSS-TAB META-ANALYSIS (FISHER'S EXACT TEST)
+# ==============================================================================
+
+def save_text_as_png(text, filename, dpi=600, font_size=10):
+    lines = text.split('\n')
+    width = max([len(line) for line in lines]) * 0.12
+    height = len(lines) * 0.35
+    plt.figure(figsize=(max(width, 6), max(height, 2)))
+    plt.axis('off')
+    plt.text(0.01, 0.99, text, fontsize=font_size, va='top', family='monospace')
+    plt.tight_layout()
+    plt.savefig(filename, dpi=dpi, bbox_inches='tight', pad_inches=0.2)
+    plt.close()
+
+
+def analyze_her2(df, label, exclude_study_nos=None):
+    """
+    Perform HER2 cross-tab meta-analysis for a given sheet (pooled 2x2 table and Fisher's exact).
+    """
+    print(f"\n========== {label} ==========")
+
+    if exclude_study_nos:
+        before_count = len(df)
+        df = df[~df['Study_no'].isin(exclude_study_nos)]
+        after_count = len(df)
+        print(f"Excluded {before_count - after_count} rows based on Study_no filter: {exclude_study_nos}")
+
+    df = df[['Group', 'Study_no', 'HER2-', 'HER2+']].copy()
+    df = df[~(((df['HER2-'] == 0) | (df['HER2-'].isna())) &
+              ((df['HER2+'] == 0) | (df['HER2+'].isna())))]
+    df[['HER2-', 'HER2+']] = df[['HER2-', 'HER2+']].replace(0, 0.1)
+    df_clean = df.dropna(subset=['HER2-', 'HER2+'])
+
+    if df_clean['Group'].nunique() < 2:
+        print("Not enough group categories for 2x2 odds ratio comparison.")
+        return
+
+    grouped = df_clean.groupby('Group')[['HER2+', 'HER2-']].sum()
+    groups = grouped.index.tolist()[:2]
+    print('grouped check:', groups)
+
+    if len(groups) < 2:
+        print("Not enough groups for comparison.")
+        return
+
+    table = grouped.loc[groups].values
+    oddsratio, pvalue = fisher_exact(table)
+    print(f"\n=== 2x2 Table ({groups[0]} vs {groups[1]}) ===")
+    print(pd.DataFrame(table, index=groups, columns=['HER2+', 'HER2-']))
+    print(f"\nOdds Ratio: {oddsratio:.3f}")
+    print(f"P-value: {pvalue:.3f}")
+
+    a = table[0, 0]
+    b = table[0, 1]
+    c = table[1, 0]
+    d = table[1, 1]
+    log_or = np.log(oddsratio)
+    se_log_or = np.sqrt(1 / a + 1 / b + 1 / c + 1 / d)
+    ci_low = np.exp(log_or - 1.96 * se_log_or)
+    ci_high = np.exp(log_or + 1.96 * se_log_or)
+    print(f"95% CI: ({ci_low:.3f}, {ci_high:.3f})")
+
+    summary_text = f"========== {label} ==========\n\n"
+    summary_text += f"=== 2x2 Table ({groups[0]} vs {groups[1]}) ===\n\n"
+    summary_text += pd.DataFrame(table, index=groups, columns=['HER2+', 'HER2-']).to_string() + "\n\n"
+    summary_text += f"Odds Ratio: {oddsratio:.3f}\n"
+    summary_text += f"95% CI: ({ci_low:.3f}, {ci_high:.3f})\n"
+    summary_text += f"P-value: {pvalue:.3f}\n"
+
+    output_path = os.path.join(output_dir, f"{label}_summary.png")
+    save_text_as_png(summary_text, output_path)
+
+
+# ==============================================================================
+# PART 2: FREEMAN-TUKEY META-ANALYSIS WITH FOREST PLOTS
+# ==============================================================================
+
+def freeman_tukey_transform(p, n):
+    return np.arcsin(np.sqrt(p / (n + 1.0))) + np.arcsin(np.sqrt((p + 1.0) / (n + 1.0)))
+
+
+def freeman_tukey_variance(n):
+    return 1.0 / (n + 0.5)
+
+
+def backtransform_ft(y):
+    return (np.sin(y / 2.0)) ** 2
+
+
+def reml_random_effects(y, v, max_iter=100, tol=1e-8):
+    y = np.asarray(y, float)
+    v = np.asarray(v, float)
+    k = len(y)
+    w = 1.0 / v
+    ybar = np.sum(w * y) / np.sum(w)
+    Q = np.sum(w * (y - ybar) ** 2)
+    df = k - 1
+    c = np.sum(w) - np.sum(w ** 2) / np.sum(w)
+    tau2 = max((Q - df) / c, 0.0)
+    for _ in range(max_iter):
+        W = 1.0 / (v + tau2)
+        mu = np.sum(W * y) / np.sum(W)
+        S1 = np.sum(W)
+        S2 = np.sum(W ** 2)
+        S3 = np.sum(W * (y - mu) ** 2)
+        tau2_new = max((S3 - (k - 1)) / (S1 - S2 / S1), 0.0)
+        if abs(tau2_new - tau2) < tol:
+            tau2 = tau2_new
+            break
+        tau2 = tau2_new
+    W = 1.0 / (v + tau2)
+    mu = np.sum(W * y) / np.sum(W)
+    se_mu = math.sqrt(1.0 / np.sum(W))
+    w_fixed = 1.0 / v
+    ybar_fixed = np.sum(w_fixed * y) / np.sum(w_fixed)
+    Q = np.sum(w_fixed * (y - ybar_fixed) ** 2)
+    I2 = max((Q - df) / Q, 0.0) if Q > 0 else 0.0
+    H2 = 1.0 / (1.0 - I2) if I2 < 1 else np.inf
+    ci_l = mu - 1.96 * se_mu
+    ci_u = mu + 1.96 * se_mu
+    pred_se = math.sqrt(se_mu ** 2 + tau2)
+    pi_l = mu - 1.96 * pred_se
+    pi_u = mu + 1.96 * pred_se
+    z = abs(mu / se_mu)
+    p_overall = 2 * (1 - stats.norm.cdf(z))
+
+    return {
+        "mu": mu, "se": se_mu, "ci": (ci_l, ci_u),
+        "pi": (pi_l, pi_u), "tau2": tau2, "Q": Q, "df": df,
+        "I2": I2, "H2": H2, "weights": W / np.sum(W),
+        "z": z, "p_overall": p_overall
+    }
+
+
+def run_outcome(df, event_col, label):
+    x = df[event_col].to_numpy(dtype=float)
+    n = df["total"].to_numpy(dtype=float)
+    y = freeman_tukey_transform(x, n)
+    v = freeman_tukey_variance(n)
+    res = reml_random_effects(y, v)
+    pooled = backtransform_ft(res["mu"])
+    lci = backtransform_ft(res["ci"][0])
+    uci = backtransform_ft(res["ci"][1])
+    pli = backtransform_ft(res["pi"][0])
+    pui = backtransform_ft(res["pi"][1])
+    out = {
+        "label": label,
+        "pooled": pooled, "ci": (lci, uci), "pi": (pli, pui),
+        "tau2": res["tau2"], "I2": res["I2"], "H2": res["H2"],
+        "Q": res["Q"], "df": res["df"], "weights": res["weights"],
+        "z": res["z"], "p_overall": res["p_overall"]
+    }
+    p = x / n
+    se = np.sqrt(np.clip(p * (1 - p) / n, 0, None))
+    out["studies"] = df["Study"].tolist()
+    out["years"] = df["Year"].tolist()
+    out["p"] = p
+    out["l"] = np.clip(p - 1.96 * se, 0, 1)
+    out["u"] = np.clip(p + 1.96 * se, 0, 1)
+    out["x"] = x
+    out["n"] = n
+    return out
+
+
+def print_summary(out):
+    print(f"\n{out['label']}")
+    print(f"Pooled prevalence (REML, FT): {out['pooled']:.3f} [{out['ci'][0]:.3f}, {out['ci'][1]:.3f}]")
+    print(f"Prediction interval: [{out['pi'][0]:.3f}, {out['pi'][1]:.3f}]")
+    print(f"Heterogeneity: tau^2={out['tau2']:.5f}, I^2={out['I2'] * 100:.2f}%, H^2={out['H2']:.3f}")
+
+
+def forest_plot(
+    out,
+    save_path=None,
+    fig_width=24,
+    fig_height_min=5,
+    height_per_study=0.4,
+    height_extra=5,
+    xlim_left=-6.5,
+    xlim_right=1.5,
+    study_pos=-6.0,
+    year_pos=-4.0,
+    events_pos=-3.0,
+    prev_pos=-2.0,
+    ci_pos=-0.8,
+    weight_pos=1.8,
+    bottom_space=-7.0,
+    y_pooled=-1.0,
+    y_pi=-5.5,
+    y_het=-2.5,
+    point_size_scale=600,
+    pooled_marker_size=180,
+    font_size=16,
+    header_font_size=18,
+    line_width=3.0,
+    grid_alpha=0.3,
+    plot_shift=-0.23,
+    plot_scale=1.3
+):
+    studies = out["studies"]
+    years = out["years"]
+    p = out["p"]
+    l = out["l"]
+    u = out["u"]
+    x = out["x"]
+    n = out["n"]
+    w_rel = 100 * out["weights"]
+    k = len(studies)
+    y = np.arange(k - 1, -1, -1)
+    pooled = out["pooled"]
+    lci, uci = out["ci"]
+    pli, pui = out["pi"]
+
+    fig, ax = plt.subplots(figsize=(fig_width, max(fig_height_min, height_per_study * k + height_extra)))
+    ax.spines['top'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    p_shifted = p + plot_shift
+    l_shifted = l + plot_shift
+    u_shifted = u + plot_shift
+    pooled_shifted = pooled + plot_shift
+    lci_shifted = lci + plot_shift
+    uci_shifted = uci + plot_shift
+    pli_shifted = pli + plot_shift
+    pui_shifted = pui + plot_shift
+
+    p_scaled = p_shifted * plot_scale
+    l_scaled = l_shifted * plot_scale
+    u_scaled = u_shifted * plot_scale
+    pooled_scaled = pooled_shifted * plot_scale
+    lci_scaled = lci_shifted * plot_scale
+    uci_scaled = uci_shifted * plot_scale
+    pli_scaled = pli_shifted * plot_scale
+    pui_scaled = pui_shifted * plot_scale
+    weight_pos_scaled = weight_pos
+
+    min_x_plot = min(np.min(l_scaled), lci_scaled, pli_scaled)
+    max_x_plot = max(np.max(u_scaled), uci_scaled, pui_scaled)
+    xlim_left = min(xlim_left, min_x_plot - 0.2)
+    xlim_right = max(xlim_right, max(max_x_plot, weight_pos_scaled) + 0.2)
+
+    ax.set_xlim(xlim_left, xlim_right)
+    ax.set_ylim(bottom_space, k + 0.5)
+
+    ax.hlines(y, l_scaled, u_scaled, color='k', lw=line_width)
+    ax.scatter(p_scaled, y, s=point_size_scale * (w_rel / 100), color='white', edgecolor='k',
+               marker='s', linewidth=line_width, zorder=2)
+
+    ax.hlines(y_pooled, lci_scaled, uci_scaled, color='blue', lw=line_width * 1.333)
+    ax.scatter(pooled_scaled, y_pooled, marker='D', color='blue', s=pooled_marker_size, zorder=3, edgecolor='k')
+
+    ax.hlines(y_pi, pli_scaled, pui_scaled, color='k', linestyle='--', lw=line_width)
+    ax.vlines(pli_scaled, y_pi - 0.25, y_pi + 0.25, color='k', lw=line_width)
+    ax.vlines(pui_scaled, y_pi - 0.25, y_pi + 0.25, color='k', lw=line_width)
+
+    ax.set_yticks([])
+    ax.set_xlabel("Prevalence (%)", fontsize=font_size + 2)
+    tick_values = np.linspace(0, 1, 11)
+    tick_shifted = tick_values + plot_shift
+    tick_positions = tick_shifted * plot_scale
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([f"{t * 100:.0f}" for t in tick_values], fontsize=font_size)
+    ax.grid(axis='x', linestyle='--', alpha=grid_alpha)
+
+    tick_center = np.mean(tick_positions)
+    xlim = ax.get_xlim()
+    axes_center = (tick_center - xlim[0]) / (xlim[1] - xlim[0])
+    ax.xaxis.set_label_coords(axes_center, -0.025)
+
+    header_y = k + 0.2
+    ax.text(study_pos, header_y, "Study", ha='left', va='bottom', fontweight='bold', fontsize=header_font_size)
+    ax.text(year_pos, header_y, "Year", ha='center', va='bottom', fontweight='bold', fontsize=header_font_size)
+    ax.text(events_pos, header_y, "Events / Total", ha='center', va='bottom', fontweight='bold',
+            fontsize=header_font_size)
+    ax.text(prev_pos, header_y, "Prevalence", ha='center', va='bottom', fontweight='bold', fontsize=header_font_size)
+    ax.text(ci_pos, header_y, "95% CI", ha='center', va='bottom', fontweight='bold', fontsize=header_font_size)
+    ax.text(weight_pos_scaled, header_y, "Weight (%)", ha='right', va='bottom', fontweight='bold',
+            fontsize=header_font_size)
+
+    for i in range(k):
+        yi = y[i]
+        ax.text(study_pos, yi, studies[i], ha='left', va='center', fontsize=font_size)
+        ax.text(year_pos, yi, str(years[i]), ha='center', va='center', fontsize=font_size)
+        ax.text(events_pos, yi, f"{int(x[i])} / {int(n[i])}", ha='center', va='center', fontsize=font_size)
+        ax.text(prev_pos, yi, f"{p[i]:.3f}", ha='center', va='center', fontsize=font_size)
+        ax.text(ci_pos, yi, f"({l[i]:.3f}, {u[i]:.3f})", ha='center', va='center', fontsize=font_size)
+        ax.text(weight_pos_scaled, yi, f"{w_rel[i]:.2f}", ha='right', va='center', fontsize=font_size)
+
+    ax.text(study_pos, y_pooled, "Overall", ha='left', va='center', fontsize=font_size, fontweight='bold')
+    ax.text(year_pos, y_pooled, "-", ha='center', va='center', fontsize=font_size)
+    ax.text(events_pos, y_pooled, "-", ha='center', va='center', fontsize=font_size)
+    ax.text(prev_pos, y_pooled, f"{pooled:.3f}", ha='center', va='center', fontsize=font_size)
+    ax.text(ci_pos, y_pooled, f"({lci:.3f}, {uci:.3f})", ha='center', va='center', fontsize=font_size)
+    ax.text(weight_pos_scaled, y_pooled, "100.00", ha='right', va='center', fontsize=font_size)
+
+    ax.text(study_pos, y_pi, "Prediction interval", ha='left', va='center', fontsize=font_size)
+    ax.text(year_pos, y_pi, "-", ha='center', va='center', fontsize=font_size)
+    ax.text(events_pos, y_pi, "-", ha='center', va='center', fontsize=font_size)
+    ax.text(prev_pos, y_pi, "-", ha='center', va='center', fontsize=font_size)
+    ax.text(ci_pos, y_pi, f"[{pli:.3f}, {pui:.3f}]", ha='center', va='center', fontsize=font_size)
+    ax.text(weight_pos_scaled, y_pi, "-", ha='right', va='center', fontsize=font_size)
+
+    p_Q = stats.chi2.sf(out["Q"], out["df"])
+    p_Q_str = "p < 0.001" if p_Q < 0.001 else f"p = {p_Q:.3f}"
+    p_overall_str = "p < 0.001" if out["p_overall"] < 0.001 else f"p = {out['p_overall']:.3f}"
+    het_text = (f"Heterogeneity: τ² = {out['tau2']:.4f}, I² = {out['I2'] * 100:.2f}%, H² = {out['H2']:.2f}\n"
+                f"Test for heterogeneity: Q({out['df']}) = {out['Q']:.2f}, {p_Q_str}\n"
+                f"Test for overall effect: z = {out['z']:.2f}, {p_overall_str}\n"
+                f"Random-effects REML model")
+    ax.text(study_pos, y_het, het_text, ha='left', va='top', fontsize=font_size, linespacing=1.2)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=600, bbox_inches='tight')
+        print(f"Plot saved to {save_path}")
+    plt.show()
+
+
+# ==============================================================================
+# PART 3: LFK INDEX / DOI PLOT
+# ==============================================================================
+
+def compute_lfk_index(effects, variances):
+    """Compute the LFK index based on effect sizes and variances."""
+    se = np.sqrt(variances)
+    z_scores = effects / se
+    precision = 1 / se
+
+    order = np.argsort(-precision)
+    z_scores = z_scores[order]
+
+    mean_z = np.mean(z_scores)
+    deviations = z_scores - mean_z
+    cum_dev = np.cumsum(deviations)
+
+    if np.std(deviations, ddof=1) == 0:
+        return np.nan
+
+    lfk_index = np.max(np.abs(cum_dev)) / np.std(deviations, ddof=1)
+    return lfk_index
+
+
+# ==============================================================================
+# EXECUTION
+# ==============================================================================
+
+# --- Part 1: Run cross-tab analyses across all sheets ---
+print("=" * 60)
+print("PART 1: CROSS-TAB META-ANALYSIS (FISHER'S EXACT TEST)")
+print("=" * 60)
+
+for sheet_name, label in zip(sheet_names, sheet_labels):
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    analyze_her2(df, label, exclude_study_nos=exclude_list)
+
+# --- Part 2: Freeman-Tukey prevalence meta-analysis with forest plots ---
+print("\n" + "=" * 60)
+print("PART 2: FREEMAN-TUKEY PREVALENCE META-ANALYSIS")
+print("=" * 60)
+
+# Load the test data (adjust sheet name as needed for your data)
+# test_df = pd.read_excel(file_path, sheet_name='YourSheetName')
+# Ensure test_df has columns: 'Study', 'Year', 'total', 0, '1+', '2+', '3+'
+
+test_df['nonzero'] = test_df['1+'] + test_df['2+'] + test_df['3+']
+
+out_3plus = run_outcome(test_df, "3+", "HER2 3+ among all cases")
+out_zero = run_outcome(test_df, 0, "HER2 0 among all cases")
+out_nonzero = run_outcome(test_df, "nonzero", "HER2 non-zero (1-3) among all cases")
+
+print_summary(out_3plus)
+print_summary(out_zero)
+print_summary(out_nonzero)
+
+forest_plot(
+    out_3plus,
+    save_path="forest_her2_3plus_new.png",
+)
+forest_plot(
+    out_zero,
+    save_path="forest_her2_zero_new.png",
+)
+forest_plot(
+    out_nonzero,
+    save_path="forest_her2_nonzero_new.png",
+)
+
+# --- Part 3: LFK index and DOI plot (0, 1+ vs 3+ only) ---
+print("\n" + "=" * 60)
+print("PART 3: LFK INDEX / DOI PLOT")
+print("=" * 60)
+
+test_df[[0, '1+', '2+', '3+']] = test_df[[0, '1+', '2+', '3+']].astype(float)
+
+negative_comb = [0, '1+']
+positive_comb = ['3+']
+
+test_df['negative'] = test_df[negative_comb].sum(axis=1)
+test_df['positive'] = test_df[positive_comb].sum(axis=1)
+
+test_df['total_lfk'] = test_df['negative'] + test_df['positive']
+test_df['prevalence'] = test_df['positive'] / test_df['total_lfk']
+test_df['prevalence'] = np.clip(test_df['prevalence'], 0.01, 0.99)
+
+test_df['effect_size'] = freeman_tukey_transform(test_df['positive'], test_df['total_lfk'])
+test_df['variance'] = 1 / (4 * test_df['total_lfk'])
+
+mean_effect = np.mean(test_df['effect_size'])
+test_df['centered_effects'] = test_df['effect_size'] - mean_effect
+test_df['z_scores'] = test_df['centered_effects'] / np.sqrt(test_df['variance'])
+
+transformed_array = test_df['centered_effects'].to_numpy()
+var_array = test_df['variance'].to_numpy()
+
+lfk_index = compute_lfk_index(transformed_array, var_array)
+if not np.isnan(lfk_index):
+    lfk_p = 2 * (1 - norm.cdf(abs(lfk_index)))
+else:
+    lfk_p = np.nan
+
+precision = 1 / np.sqrt(var_array)
+z_scores = test_df['z_scores'].to_numpy()
+
+plt.figure(figsize=(6, 6))
+plt.scatter(z_scores, precision, c='blue', label='Data Points')
+plt.axvline(0, color='red', linestyle='--', label='Zero Line')
+plt.gca().invert_yaxis()
+plt.xlabel('Z-score')
+plt.ylabel('Precision (1/SE)')
+plt.legend()
+
+plot_filename = "doi_plot_w_freeman_tukey_transform_neg_0_1+_pos_3+.png"
+plt.savefig(plot_filename, dpi=600, bbox_inches='tight')
+plt.close()
+
+print(f"\n=== Negative Group: {negative_comb} | Positive Group: {positive_comb} ===")
+print(f"LFK Index: {lfk_index:.2f}, p-value: {lfk_p:.4f}")
+print(f"DOI Plot saved as: {plot_filename}")
+if not np.isnan(lfk_index):
+    if abs(lfk_index) <= 1:
+        print("LFK index → No asymmetry")
+    elif abs(lfk_index) <= 2:
+        print("LFK index → Minor asymmetry")
+    else:
+        print("LFK index → Major asymmetry")
+
+print("\n" + "=" * 60)
+print("ALL ANALYSES COMPLETE")
+print("=" * 60)
