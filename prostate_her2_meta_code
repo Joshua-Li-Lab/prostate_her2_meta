@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 from scipy.stats import fisher_exact, norm
+import statsmodels.formula.api as smf
 
 # ==============================================================================
 # CONFIGURATION
@@ -379,6 +380,73 @@ def compute_lfk_index(effects, variances):
 
 
 # ==============================================================================
+# PART 4: META-REGRESSION WITH RANDOM EFFECTS (DerSimonian-Laird)
+# ==============================================================================
+
+def meta_regression_with_random_effects(data, independent_vars):
+
+    df = data.copy()
+
+    # Calculate the log odds ratio (effect size)
+    df['effect_size'] = np.log((df['positive'] + 0.1) / (df['negative'] + 0.1))
+
+    # Calculate the variance of the effect size
+    df['variance'] = 1 / (df['positive'] + 0.1) + 1 / (df['negative'] + 0.1)
+
+    # Calculate the initial weights (inverse-variance weights)
+    df['weight_fixed'] = 1 / df['variance']
+
+    # Calculate Q (heterogeneity statistic)
+    weighted_mean = (df['effect_size'] * df['weight_fixed']).sum() / df['weight_fixed'].sum()
+    df['q_component'] = df['weight_fixed'] * (df['effect_size'] - weighted_mean) ** 2
+    Q = df['q_component'].sum()
+
+    # Degrees of freedom
+    df_degrees = len(df) - 1
+
+    # Between-study variance (tau^2) using DerSimonian and Laird method
+    c = df['weight_fixed'].sum() - (df['weight_fixed'] ** 2).sum() / df['weight_fixed'].sum()
+    tau_squared = max((Q - df_degrees) / c, 0)
+
+    # Calculate I-squared heterogeneity
+    i_squared = max(0, 100 * (Q - df_degrees) / Q) if Q != 0 else 0
+    print(f"I-squared: {i_squared:.2f}%")
+
+    # Adjust weights for random effects
+    df['weight_random'] = 1 / (df['variance'] + tau_squared)
+
+    # Create the regression formula
+    dependent_var = 'effect_size'
+    formula = dependent_var + ' ~ ' + ' + '.join(independent_vars)
+    print(f"Regression formula: {formula}")
+
+    # Fit the weighted regression model with random-effects weights
+    model = smf.wls(formula=formula, data=df, weights=df['weight_random']).fit()
+
+    return model.summary()
+
+
+def display_and_save_regression_summary(summary, output_filename):
+    """
+    Display and save the regression summary as a plot.
+
+    Parameters:
+    - summary: Regression summary object.
+    - output_filename: Path to save the plot (e.g., "regression_summary.png").
+    """
+    summary_text = summary.as_text()
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.axis('off')
+    ax.text(0.01, 0.99, summary_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', fontfamily='monospace')
+    plt.tight_layout()
+    plt.savefig(output_filename, dpi=600, bbox_inches='tight')
+    print(f"Regression summary saved to {output_filename}")
+    plt.show()
+
+
+# ==============================================================================
 # EXECUTION
 # ==============================================================================
 
@@ -395,10 +463,6 @@ for sheet_name, label in zip(sheet_names, sheet_labels):
 print("\n" + "=" * 60)
 print("PART 2: FREEMAN-TUKEY PREVALENCE META-ANALYSIS")
 print("=" * 60)
-
-# Load the test data (adjust sheet name as needed for your data)
-# test_df = pd.read_excel(file_path, sheet_name='YourSheetName')
-# Ensure test_df has columns: 'Study', 'Year', 'total', 0, '1+', '2+', '3+'
 
 test_df['nonzero'] = test_df['1+'] + test_df['2+'] + test_df['3+']
 
@@ -423,7 +487,7 @@ forest_plot(
     save_path="forest_her2_nonzero_new.png",
 )
 
-# --- Part 3: LFK index and DOI plot (0, 1+ vs 3+ only) ---
+# --- Part 3: LFK index and DOI plot (0, 1+ vs 3+) ---
 print("\n" + "=" * 60)
 print("PART 3: LFK INDEX / DOI PLOT")
 print("=" * 60)
@@ -481,6 +545,25 @@ if not np.isnan(lfk_index):
         print("LFK index → Minor asymmetry")
     else:
         print("LFK index → Major asymmetry")
+
+# --- Part 4: Meta-regression with random effects ---
+print("\n" + "=" * 60)
+print("PART 4: META-REGRESSION WITH RANDOM EFFECTS")
+print("=" * 60)
+
+independent_vars = [
+    'Year_ind',
+    'Instution_country_ind',
+    'HER2IHC_clone_ind',
+    'N_count_ind',
+    'HER2IHC_assessment_method_ind',
+    'Study_type_ind'
+]
+
+regression_summary = meta_regression_with_random_effects(combined_df, independent_vars)
+
+output_regression_path = os.path.join(output_dir, "regression_summary_random_effects.png")
+display_and_save_regression_summary(regression_summary, output_regression_path)
 
 print("\n" + "=" * 60)
 print("ALL ANALYSES COMPLETE")
